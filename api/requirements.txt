@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pydantic
+supabase
+python-dotenv
+python-multipart
+PyMuPDF
+python-docx
+langdetect
+torchaudio
+TTS
+deep-translator
+sentencepiece
+transformers==4.36.2
+tokenizers<0.19
+huggingface-hub<1.0
