@@ -1,10 +1,3 @@
-import os
-
-# Windows dev fix: avoid OpenMP duplicate runtime crash (PyTorch + NumPy/Sklearn).
-# Best long-term fix is to ensure only one OpenMP runtime is present, but this
-# env var unblocks local development.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles

@@ -16,8 +16,8 @@ _translator_cache: dict[tuple[str, str], tuple[object, object]] = {}
 
 class SummarizeRequest(BaseModel):
     text: str
-    max_length: int | None = 140
-    min_length: int | None = 40
+    max_length: int | None = 200
+    min_length: int | None = 50
 
 
 class TranslateRequest(BaseModel):
@@ -79,7 +79,9 @@ def get_translator(source_language: str, target_language: str):
                 self._t = GoogleTranslator(source=src, target=tgt)
 
             def translate(self, s: str) -> str:
-                return self._t.translate(s)
+                # Avoid 5000 limit for deep-translator
+                chunks = [s[i:i+4500] for i in range(0, len(s), 4500)]
+                return " ".join([self._t.translate(c) for c in chunks if c.strip()])
 
         ot = _OnlineTranslator(source_language, target_language)
         _translator_cache[key] = (ot, None)
@@ -92,8 +94,8 @@ async def summarize(req: SummarizeRequest):
     if not text:
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
-    max_len = int(req.max_length or 140)
-    min_len = int(req.min_length or 40)
+    max_len = int(req.max_length or 200)
+    min_len = int(req.min_length or 50)
     if min_len >= max_len:
         raise HTTPException(status_code=400, detail="min_length must be < max_length.")
 
@@ -102,7 +104,7 @@ async def summarize(req: SummarizeRequest):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device)
 
-        chunk = text[:6000]
+        chunk = text[:3500]
         inputs = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=1024).to(device)
         summary_ids = model.generate(
             **inputs,
@@ -132,7 +134,7 @@ async def translate(req: TranslateRequest):
 
     try:
         model, tokenizer = get_translator(src, tgt)
-        chunk = text[:6000]
+        chunk = text[:15000]
 
         if tokenizer is None:
             # Online fallback
