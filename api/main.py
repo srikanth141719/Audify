@@ -1,7 +1,12 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+
+# Windows OpenMP runtime collisions can happen when torch/torchaudio/transformers
+# pull different OpenMP-linked binaries. This opt-in fallback keeps dev server booting.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 # Import modular ML routers
 from routers import extract, tone, audio, nlp

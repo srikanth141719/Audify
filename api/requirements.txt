@@ -10,6 +10,8 @@ langdetect
 torchaudio
 TTS
 deep-translator
+gTTS
+pydub
 sentencepiece
 transformers==4.36.2
 tokenizers<0.19

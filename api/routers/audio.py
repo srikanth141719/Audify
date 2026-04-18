@@ -23,6 +23,30 @@ asr_model = None
 labels = None
 
 generated_dir = Path(__file__).resolve().parent.parent / "generated"
+SUPPORTED_XTTS_LANGS = {
+    "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
+    "cs", "ar", "zh-cn", "ja", "ko", "hu", "hi",
+}
+LANG_ALIASES = {
+    "english": "en",
+    "spanish": "es",
+    "french": "fr",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "polish": "pl",
+    "turkish": "tr",
+    "russian": "ru",
+    "dutch": "nl",
+    "czech": "cs",
+    "arabic": "ar",
+    "chinese": "zh-cn",
+    "chinese-simplified": "zh-cn",
+    "japanese": "ja",
+    "korean": "ko",
+    "hungarian": "hu",
+    "hindi": "hi",
+}
 
 def load_models():
     """Lazily load heavy ML models when the endpoint is first hit."""
@@ -107,6 +131,34 @@ def apply_emotion_markup(text: str, emotion: str) -> str:
     if emotion in {"fear"}:
         return base.replace(".", "...").replace("!", "!")
     return base
+
+
+def normalize_language_code(lang: str) -> str:
+    cleaned = (lang or "").strip().lower().replace("_", "-")
+    return LANG_ALIASES.get(cleaned, cleaned)
+
+
+def normalize_text_for_tts(text: str) -> str:
+    # Keeps punctuation pronounceable and avoids odd pauses.
+    text = text.replace("`", "'").replace("’", "'").replace("“", "\"").replace("”", "\"")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def prepare_speaker_audio(path_in: str, path_out: str) -> str:
+    # XTTS is significantly more stable with mono 24k and normalized level.
+    wav, sr = torchaudio.load(path_in)
+    if wav.numel() == 0:
+        raise RuntimeError("Speaker reference audio is empty.")
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if sr != 24000:
+        wav = torchaudio.functional.resample(wav, sr, 24000)
+    peak = wav.abs().max().item()
+    if peak > 0:
+        wav = wav * (0.95 / peak)
+    torchaudio.save(path_out, wav, 24000)
+    return path_out
 
 def split_into_sentences(text: str, max_chars: int = 200) -> list[str]:
     # A simple heuristic to avoid TTS sequence length errors (like 616 > 512)
@@ -247,14 +299,21 @@ async def generate_audio_clone(
     if tts_clone_model is None:
         raise HTTPException(status_code=500, detail="Clone TTS Model failed to load.")
 
+    target_language = normalize_language_code(target_language)
     if not target_language.strip():
         raise HTTPException(status_code=400, detail="target_language is required.")
+    if target_language not in SUPPORTED_XTTS_LANGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported clone language '{target_language}'. Supported languages: {', '.join(sorted(SUPPORTED_XTTS_LANGS))}",
+        )
 
     generated_dir.mkdir(parents=True, exist_ok=True)
     out_filename = f"clone_{uuid.uuid4()}.wav"
     out_path = str(generated_dir / out_filename)
 
     speaker_path = None
+    speaker_prepared_path = None
     is_temp_speaker = False
 
     try:
@@ -273,21 +332,30 @@ async def generate_audio_clone(
         if not speaker_path or not os.path.exists(speaker_path):
             raise HTTPException(status_code=400, detail="A valid clone audio file (stored or uploaded) must be provided.")
 
-        final_text = text
+        final_text = normalize_text_for_tts(text)
         if emotive and target_language == "en":
             try:
                 from transformers import pipeline
                 clf = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", top_k=1)
-                emotion = clf(text[:2000])[0][0]["label"]
-                final_text = apply_emotion_markup(text, emotion)
+                emotion = clf(final_text[:2000])[0][0]["label"]
+                final_text = apply_emotion_markup(final_text, emotion)
             except Exception:
                 pass
 
-        chunks = split_into_sentences(final_text, 250)
+        speaker_prepared_path = str(generated_dir / f"spk_norm_{uuid.uuid4()}.wav")
+        speaker_path = prepare_speaker_audio(speaker_path, speaker_prepared_path)
+
+        chunks = split_into_sentences(final_text, 180)
         temp_wavs = []
         for c in chunks:
             tmp_p = str(generated_dir / f"tmp_{uuid.uuid4()}.wav")
-            tts_clone_model.tts_to_file(text=c, speaker_wav=speaker_path, language=target_language, file_path=tmp_p)
+            tts_clone_model.tts_to_file(
+                text=c,
+                speaker_wav=speaker_path,
+                language=target_language,
+                file_path=tmp_p,
+                split_sentences=True,
+            )
             temp_wavs.append(tmp_p)
             
         try:
@@ -297,7 +365,13 @@ async def generate_audio_clone(
                 combined += AudioSegment.from_wav(w)
             combined.export(out_path, format="wav")
         except:
-            tts_clone_model.tts_to_file(text=final_text[:250], speaker_wav=speaker_path, language=target_language, file_path=out_path)
+            tts_clone_model.tts_to_file(
+                text=final_text[:250],
+                speaker_wav=speaker_path,
+                language=target_language,
+                file_path=out_path,
+                split_sentences=True,
+            )
             
         for w in temp_wavs:
             if os.path.exists(w): os.remove(w)
@@ -323,5 +397,7 @@ async def generate_audio_clone(
         try:
             if is_temp_speaker and speaker_path and os.path.exists(speaker_path):
                 os.remove(speaker_path)
+            if speaker_prepared_path and os.path.exists(speaker_prepared_path):
+                os.remove(speaker_prepared_path)
         except Exception:
             pass
