@@ -49,7 +49,7 @@ class TranslateRequest(BaseModel):
 def get_summarizer():
     global _summarizer_model, _summarizer_tokenizer
     if _summarizer_model is None or _summarizer_tokenizer is None:
-        model_name = "sshleifer/distilbart-cnn-12-6"
+        model_name = "facebook/bart-large-cnn"
         _summarizer_tokenizer = AutoTokenizer.from_pretrained(model_name)
         _summarizer_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
     return _summarizer_model, _summarizer_tokenizer

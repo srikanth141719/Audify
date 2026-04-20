@@ -16,7 +16,6 @@ except Exception:
 router = APIRouter(prefix="/api/audio", tags=["Audio"])
 
 # Global placeholders for models
-tts_model = None
 tts_clone_model = None
 bundle = None
 asr_model = None
@@ -50,19 +49,9 @@ LANG_ALIASES = {
 
 def load_models():
     """Lazily load heavy ML models when the endpoint is first hit."""
-    global tts_model, tts_clone_model, bundle, asr_model, labels
+    global tts_clone_model, bundle, asr_model, labels
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    if tts_model is None:
-        try:
-            # For a reliable local dev experience (no voice sample required),
-            # prefer a simple English single-speaker model that doesn't require
-            # external phonemizers (e.g. espeak-ng).
-            from TTS.api import TTS
-            tts_model = TTS("tts_models/en/ljspeech/tacotron2-DDC").to(device)
-        except Exception as e:
-            print("Failed to load TTS model:", e)
-
     if tts_clone_model is None:
         try:
             # Voice cloning (needs a reference wav)
@@ -197,207 +186,147 @@ async def save_voice(file: UploadFile = File(...)):
 async def generate_audio(
     request: Request,
     text: str = Form(...),
-    target_language: str = Form(...),
-    speaker_wav: UploadFile | None = File(None),
-    voice_preset: str = Form("female"),
-):
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Text is required.")
-        
-    generated_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Non-English Fallback Check (Default Male/Female uses Google TTS if no clone)
-    if target_language != "en":
-        try:
-            from gtts import gTTS
-            out_filename = f"gen_{uuid.uuid4()}.mp3"
-            out_path = str(generated_dir / out_filename)
-            tts = gTTS(text=text, lang=target_language, slow=False)
-            tts.save(out_path)
-            duration_sec = len(text) / 15.0 # Rough approx: 15 chars per sec for timestamps
-            timestamps = align_timestamps_heuristic(text, duration_sec)
-            return {
-                "audio_url": str(request.base_url).rstrip("/") + f"/generated/{out_filename}",
-                "duration": duration_sec,
-                "timestamps": timestamps
-            }
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"gTTS Fallback failed: {str(e)}")
-
-    load_models()
-    if tts_model is None:
-        raise HTTPException(status_code=500, detail="TTS Model failed to load.")
-        
-    out_filename = f"gen_{uuid.uuid4()}.wav"
-    out_path = str(generated_dir / out_filename)
-    
-    try:
-        chunks = split_into_sentences(text, 250)
-        temp_wavs = []
-        for c in chunks:
-            tmp_p = str(generated_dir / f"tmp_{uuid.uuid4()}.wav")
-            tts_model.tts_to_file(text=c, file_path=tmp_p)
-            temp_wavs.append(tmp_p)
-            
-        try:
-            from pydub import AudioSegment
-            combined = AudioSegment.from_wav(temp_wavs[0])
-            for w in temp_wavs[1:]:
-                combined += AudioSegment.from_wav(w)
-            combined.export(out_path, format="wav")
-        except:
-            # simple single chunk fallback if pydub fails
-            tts_model.tts_to_file(text=text[:500], file_path=out_path)
-            
-        for w in temp_wavs:
-            if os.path.exists(w): os.remove(w)
-
-        if voice_preset.lower() == "male":
-            try:
-                with wave.open(out_path, "rb") as rf:
-                    nch, sw, sr = rf.getnchannels(), rf.getsampwidth(), rf.getframerate()
-                    frames = rf.readframes(rf.getnframes())
-                new_sr = max(8000, int(sr * 0.80))
-                with wave.open(out_path, "wb") as wf:
-                    wf.setnchannels(nch)
-                    wf.setsampwidth(sw)
-                    wf.setframerate(new_sr)
-                    wf.writeframes(frames)
-            except: pass
-
-        duration_sec = 0.0
-        try:
-            with wave.open(out_path, "rb") as wf:
-                duration_sec = wf.getnframes() / float(wf.getframerate()) if wf.getframerate() else 0.0
-        except: pass
-        if duration_sec <= 0: duration_sec = len(text) / 15.0
-        
-        timestamps = align_timestamps_heuristic(text, duration_sec)
-        
-        return {
-            "audio_url": str(request.base_url).rstrip("/") + f"/generated/{out_filename}",
-            "duration": duration_sec,
-            "timestamps": timestamps
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
-
-
-@router.post("/generate-clone")
-async def generate_audio_clone(
-    request: Request,
-    text: str = Form(...),
-    target_language: str = Form(...),
+    target_language: str = Form("en"),
+    engine_type: str = Form("standard"),
     speaker_wav: UploadFile | None = File(None),
     voice_id: str | None = Form(None),
     emotive: bool = Form(False),
 ):
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required.")
-
-    load_models()
-    if tts_clone_model is None:
-        raise HTTPException(status_code=500, detail="Clone TTS Model failed to load.")
-
-    target_language = normalize_language_code(target_language)
-    if not target_language.strip():
-        raise HTTPException(status_code=400, detail="target_language is required.")
-    if target_language not in SUPPORTED_XTTS_LANGS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported clone language '{target_language}'. Supported languages: {', '.join(sorted(SUPPORTED_XTTS_LANGS))}",
-        )
-
+        
     generated_dir.mkdir(parents=True, exist_ok=True)
-    out_filename = f"clone_{uuid.uuid4()}.wav"
-    out_path = str(generated_dir / out_filename)
+    target_lang_code = normalize_language_code(target_language)
 
-    speaker_path = None
-    speaker_prepared_path = None
-    is_temp_speaker = False
-
-    try:
-        # Determine Reference Voice
-        if voice_id:
-            voices_dir = Path(__file__).resolve().parent.parent / "voices"
-            vp = voices_dir / voice_id
-            if vp.exists():
-                speaker_path = str(vp)
-        elif speaker_wav:
-            is_temp_speaker = True
-            speaker_path = str(generated_dir / f"spk_{uuid.uuid4()}.wav")
-            with open(speaker_path, "wb") as f:
-                f.write(await speaker_wav.read())
-                
-        if not speaker_path or not os.path.exists(speaker_path):
-            raise HTTPException(status_code=400, detail="A valid clone audio file (stored or uploaded) must be provided.")
-
-        final_text = normalize_text_for_tts(text)
-        if emotive and target_language == "en":
+    if engine_type == "standard":
+        try:
+            from gtts import gTTS
+            out_filename = f"gen_{uuid.uuid4()}.mp3"
+            out_path = str(generated_dir / out_filename)
+            tts = gTTS(text=text, lang=target_lang_code, slow=False)
+            tts.save(out_path)
+            # Try to get real duration using pydub if possible, fallback to heuristic
+            duration_sec = len(text) / 15.0
             try:
-                from transformers import pipeline
-                clf = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", top_k=1)
-                emotion = clf(final_text[:2000])[0][0]["label"]
-                final_text = apply_emotion_markup(final_text, emotion)
+                from pydub import AudioSegment
+                audio = AudioSegment.from_mp3(out_path)
+                duration_sec = len(audio) / 1000.0
+            except: pass
+            
+            timestamps = align_timestamps_heuristic(text, duration_sec)
+            return {
+                "audio_url": str(request.base_url).rstrip("/") + f"/generated/{out_filename}",
+                "duration": duration_sec,
+                "timestamps": timestamps,
+                "mode": "standard"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"gTTS standard generation failed: {str(e)}")
+
+    elif engine_type == "premium":
+        load_models()
+        if tts_clone_model is None:
+            raise HTTPException(status_code=500, detail="Premium TTS Model failed to load.")
+
+        if not target_lang_code.strip():
+            raise HTTPException(status_code=400, detail="target_language is required.")
+        if target_lang_code not in SUPPORTED_XTTS_LANGS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported premium language '{target_lang_code}'. Supported languages: {', '.join(sorted(SUPPORTED_XTTS_LANGS))}",
+            )
+
+        out_filename = f"gen_premium_{uuid.uuid4()}.wav"
+        out_path = str(generated_dir / out_filename)
+
+        speaker_path = None
+        speaker_prepared_path = None
+        is_temp_speaker = False
+
+        try:
+            # Determine Reference Voice
+            if voice_id:
+                voices_dir = Path(__file__).resolve().parent.parent / "voices"
+                vp = voices_dir / voice_id
+                if vp.exists():
+                    speaker_path = str(vp)
+            elif speaker_wav:
+                is_temp_speaker = True
+                speaker_path = str(generated_dir / f"spk_{uuid.uuid4()}.wav")
+                with open(speaker_path, "wb") as f:
+                    f.write(await speaker_wav.read())
+                    
+            if not speaker_path or not os.path.exists(speaker_path):
+                raise HTTPException(status_code=400, detail="A valid clone audio file (stored or uploaded) must be provided for premium engine.")
+
+            final_text = normalize_text_for_tts(text)
+            if emotive and target_lang_code == "en":
+                try:
+                    from transformers import pipeline
+                    clf = pipeline("text-classification", model="j-hartmann/emotion-english-distilroberta-base", top_k=1)
+                    emotion = clf(final_text[:2000])[0][0]["label"]
+                    final_text = apply_emotion_markup(final_text, emotion)
+                except Exception:
+                    pass
+
+            speaker_prepared_path = str(generated_dir / f"spk_norm_{uuid.uuid4()}.wav")
+            speaker_path = prepare_speaker_audio(speaker_path, speaker_prepared_path)
+
+            chunks = split_into_sentences(final_text, 180)
+            temp_wavs = []
+            for c in chunks:
+                tmp_p = str(generated_dir / f"tmp_{uuid.uuid4()}.wav")
+                tts_clone_model.tts_to_file(
+                    text=c,
+                    speaker_wav=speaker_path,
+                    language=target_lang_code,
+                    file_path=tmp_p,
+                    split_sentences=True,
+                )
+                temp_wavs.append(tmp_p)
+                
+            try:
+                from pydub import AudioSegment
+                combined = AudioSegment.from_wav(temp_wavs[0])
+                for w in temp_wavs[1:]:
+                    combined += AudioSegment.from_wav(w)
+                combined.export(out_path, format="wav")
+            except:
+                tts_clone_model.tts_to_file(
+                    text=final_text[:250],
+                    speaker_wav=speaker_path,
+                    language=target_lang_code,
+                    file_path=out_path,
+                    split_sentences=True,
+                )
+                
+            for w in temp_wavs:
+                if os.path.exists(w): os.remove(w)
+
+            duration_sec = 0.0
+            try:
+                with wave.open(out_path, "rb") as wf:
+                    duration_sec = wf.getnframes() / float(wf.getframerate()) if wf.getframerate() else 0.0
+            except: pass
+            if duration_sec <= 0: duration_sec = len(text) / 15.0
+
+            timestamps = align_timestamps_heuristic(text, duration_sec)
+
+            return {
+                "audio_url": str(request.base_url).rstrip("/") + f"/generated/{out_filename}",
+                "duration": duration_sec,
+                "timestamps": timestamps,
+                "mode": "premium",
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+        finally:
+            try:
+                if is_temp_speaker and speaker_path and os.path.exists(speaker_path):
+                    os.remove(speaker_path)
+                if speaker_prepared_path and os.path.exists(speaker_prepared_path):
+                    os.remove(speaker_prepared_path)
             except Exception:
                 pass
-
-        speaker_prepared_path = str(generated_dir / f"spk_norm_{uuid.uuid4()}.wav")
-        speaker_path = prepare_speaker_audio(speaker_path, speaker_prepared_path)
-
-        chunks = split_into_sentences(final_text, 180)
-        temp_wavs = []
-        for c in chunks:
-            tmp_p = str(generated_dir / f"tmp_{uuid.uuid4()}.wav")
-            tts_clone_model.tts_to_file(
-                text=c,
-                speaker_wav=speaker_path,
-                language=target_language,
-                file_path=tmp_p,
-                split_sentences=True,
-            )
-            temp_wavs.append(tmp_p)
-            
-        try:
-            from pydub import AudioSegment
-            combined = AudioSegment.from_wav(temp_wavs[0])
-            for w in temp_wavs[1:]:
-                combined += AudioSegment.from_wav(w)
-            combined.export(out_path, format="wav")
-        except:
-            tts_clone_model.tts_to_file(
-                text=final_text[:250],
-                speaker_wav=speaker_path,
-                language=target_language,
-                file_path=out_path,
-                split_sentences=True,
-            )
-            
-        for w in temp_wavs:
-            if os.path.exists(w): os.remove(w)
-
-        duration_sec = 0.0
-        try:
-            with wave.open(out_path, "rb") as wf:
-                duration_sec = wf.getnframes() / float(wf.getframerate()) if wf.getframerate() else 0.0
-        except: pass
-        if duration_sec <= 0: duration_sec = len(text) / 15.0
-
-        timestamps = align_timestamps_heuristic(text, duration_sec)
-
-        return {
-            "audio_url": str(request.base_url).rstrip("/") + f"/generated/{out_filename}",
-            "duration": duration_sec,
-            "timestamps": timestamps,
-            "mode": "clone",
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
-    finally:
-        try:
-            if is_temp_speaker and speaker_path and os.path.exists(speaker_path):
-                os.remove(speaker_path)
-            if speaker_prepared_path and os.path.exists(speaker_prepared_path):
-                os.remove(speaker_prepared_path)
-        except Exception:
-            pass
+    else:
+        raise HTTPException(status_code=400, detail="Invalid engine_type. Allowed values: 'standard', 'premium'.")
